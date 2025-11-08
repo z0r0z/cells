@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-import {Cell, Cells} from "../src/Cells.sol";
+import {Cell, CellsLite} from "../src/CellsLite.sol";
 import {Test} from "../lib/forge-std/src/Test.sol";
 
 contract Sink {
@@ -38,7 +38,9 @@ contract CellsTest is Test {
         bob = vm.addr(pkBob);
         guardian = vm.addr(pkG);
 
-        cell = new Cell(alice, bob, address(0));
+        CellsLite factory = new CellsLite();
+
+        (cell,,) = factory.createCell(alice, bob, address(0), bytes32(0), new bytes[](0));
         sink = new Sink();
 
         // fund the wallet for value-forwarding tests
@@ -1132,7 +1134,9 @@ contract CellsTest is Test {
         // Create in reverse lexical order; contract should sort ascending
         address A = address(0xB); // bigger
         address B = address(0xA); // smaller
-        Cell c2 = new Cell(A, B, address(0));
+        CellsLite factory = new CellsLite();
+        Cell c2;
+        (c2,,) = factory.createCell(A, B, address(0), bytes32(0), new bytes[](0));
         assertTrue(c2.owners(0) < c2.owners(1));
     }
 

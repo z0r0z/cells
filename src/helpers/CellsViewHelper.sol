@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-/// @title Cells View Helper (minimal, range-paginated)
-/// @notice One-shot views for Cells/Cell state to minimize RPC overhead for UIs.
+/// @title Cells View Helper (maximal, user-scoped, one-shot)
+/// @notice One-shot views for Cells/Cell state + owner ENS + chat tails to minimize RPC overhead for UIs.
 contract CellsViewHelper {
     /// -----------------------------------------------------------------------
     /// Config
     /// -----------------------------------------------------------------------
+    // Original Cells factory
     address constant CELLS = 0x000000000022Edf13B917B80B4c0B52fab2eC902;
+
+    // New CellsLite factory (minimal proxy variant)
+    address constant CELLS_LITE = 0x000000000022fe09b19508Ceeb97FBEb41B66d0F;
+
+    // External helper for reverse ENS (must return "" for no-name, never revert)
+    address constant CHECK_THE_CHAIN = 0x0000000000cDC1F8d393415455E382c30FBc0a84;
 
     // Fixed token set in UI-preferred order
     uint256 constant NUM_TOKENS = 9;
@@ -44,6 +51,13 @@ contract CellsViewHelper {
     bytes4 constant CELLS_COUNT = bytes4(keccak256("getCellCount()"));
     bytes4 constant CELLS_AT = bytes4(keccak256("cells(uint256)"));
 
+    // Chat selectors on Cell
+    bytes4 constant CELL_CHAT_COUNT = bytes4(keccak256("getChatCount()"));
+    bytes4 constant CELL_MESSAGES = bytes4(keccak256("messages(uint256)"));
+
+    // ENS helper
+    bytes4 constant WHAT_IS_THE_NAME_OF = bytes4(keccak256("whatIsTheNameOf(address)"));
+
     /// -----------------------------------------------------------------------
     /// Types
     /// -----------------------------------------------------------------------
@@ -57,9 +71,23 @@ contract CellsViewHelper {
     struct UserCellState {
         address cell;
         uint8 role; // 0,1,3
+        address[3] owners; // included for completeness/compatibility
         uint256[NUM_TOKENS] balances; // Cell's balances
         uint256[NUM_TOKENS] allowanceToUser; // allowance(token, user)
         uint256[NUM_TOKENS] allowanceToOtherOwner; // allowance(token, other 1/2 owner). Zero if guardian.
+    }
+
+    /// @dev Maximal UI payload per cell for a connected user
+    struct CellDeep {
+        address cell;
+        address[3] owners; // owner0, owner1, guardian
+        string[3] ownerENS; // reverse ENS for owners ("" if none or includeENS=false)
+        uint8 userRole; // 0,1,3 or 255
+        uint256[NUM_TOKENS] balances; // cell token balances
+        uint256[NUM_TOKENS] allowanceToUser;
+        uint256[NUM_TOKENS] allowanceToOtherOwner;
+        uint256 chatCount; // total message count
+        string[] lastMessages; // tail, length <= maxChatTail (can be empty)
     }
 
     /// -----------------------------------------------------------------------
@@ -92,7 +120,7 @@ contract CellsViewHelper {
     }
 
     /// -----------------------------------------------------------------------
-    /// Global snapshots (owners + balances) with pagination
+    /// Global snapshots (owners + balances) with pagination (back-compat)
     /// -----------------------------------------------------------------------
 
     function getCellsStateRange(uint256 start, uint256 count)
@@ -125,7 +153,7 @@ contract CellsViewHelper {
     }
 
     /// -----------------------------------------------------------------------
-    /// Per-user one-shot state with pagination
+    /// Per-user one-shot state (back-compat; includes owners)
     /// -----------------------------------------------------------------------
 
     function getUserCellsStateRange(address user, uint256 start, uint256 count)
@@ -136,7 +164,6 @@ contract CellsViewHelper {
         (uint256 s, uint256 n) = _boundedRange(start, count);
         if (n == 0) return out;
 
-        // Pass 1: collect matches (avoid re-reading same indices in a second _match call)
         address[] memory matched = new address[](n);
         uint8[] memory roles = new uint8[](n);
         uint256 m;
@@ -157,7 +184,6 @@ contract CellsViewHelper {
         }
         if (m == 0) return out;
 
-        // Pass 2: build user state
         out = new UserCellState[](m);
         for (uint256 j; j != m;) {
             address cell = matched[j];
@@ -167,7 +193,6 @@ contract CellsViewHelper {
             uint8 role = roleIdx < 2 ? roleIdx : ROLE_GUARD;
 
             uint256[NUM_TOKENS] memory bals = _balancesOf(cell);
-
             uint256[NUM_TOKENS] memory toUser = _allowancesAll(cell, user);
 
             uint256[NUM_TOKENS] memory toOther;
@@ -179,6 +204,7 @@ contract CellsViewHelper {
             out[j] = UserCellState({
                 cell: cell,
                 role: role,
+                owners: os,
                 balances: bals,
                 allowanceToUser: toUser,
                 allowanceToOtherOwner: toOther
@@ -202,7 +228,183 @@ contract CellsViewHelper {
     }
 
     /// -----------------------------------------------------------------------
-    /// Internals: bounds, owners, balances, allowances
+    /// Maximal per-user one-shot state (owners + ENS + balances + allowances + chat tail)
+    /// -----------------------------------------------------------------------
+
+    /// @notice Deep, user-scoped snapshot over [start .. start+count) of the logical Cells list
+    ///         (CELLS first, then CELLS_LITE).
+    /// @param user          The connected user to scope allowances/role to.
+    /// @param start         Start logical index.
+    /// @param count         Max number of indices to scan from start.
+    /// @param maxChatTail   Tail length of messages to include per cell (0 to skip).
+    /// @param includeENS    If true, resolves owner ENS with CheckTheChain (3 extra calls per cell).
+    function getUserCellsDeepRange(
+        address user,
+        uint256 start,
+        uint256 count,
+        uint8 maxChatTail,
+        bool includeENS
+    ) public view returns (CellDeep[] memory out) {
+        (uint256 s, uint256 n) = _boundedRange(start, count);
+        if (n == 0) return out;
+
+        // Pass 1: filter membership & cache role indices
+        address[] memory matched = new address[](n);
+        uint8[] memory roleIdxs = new uint8[](n);
+        uint256 m;
+        for (uint256 i; i != n;) {
+            address cell = _getCellAt(s + i);
+            uint8 r = _roleInCell(cell, user);
+            if (r != ROLE_NONE) {
+                matched[m] = cell;
+                roleIdxs[m] = r;
+                unchecked {
+                    ++m;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        if (m == 0) return out;
+
+        // Pass 2: build full UI payload
+        out = new CellDeep[](m);
+        for (uint256 j; j != m;) {
+            address cell = matched[j];
+            uint8 roleIdx = roleIdxs[j];
+
+            // Owners
+            address[3] memory os = _owners3(cell);
+
+            // ENS (explicitly initialize to empty strings if not included)
+            string[3] memory ens;
+            if (includeENS) {
+                ens[0] = _ensName(os[0]);
+                ens[1] = _ensName(os[1]);
+                ens[2] = _ensName(os[2]);
+            } else {
+                ens[0] = "";
+                ens[1] = "";
+                ens[2] = "";
+            }
+
+            // Balances & allowances
+            uint256[NUM_TOKENS] memory bals = _balancesOf(cell);
+            uint256[NUM_TOKENS] memory toUser = _allowancesAll(cell, user);
+
+            uint256[NUM_TOKENS] memory toOther;
+            if (roleIdx < 2) {
+                address other = os[roleIdx ^ 1];
+                toOther = _allowancesAll(cell, other);
+            }
+            uint8 role = roleIdx < 2 ? roleIdx : ROLE_GUARD;
+
+            // Chat tail (always initialize dynamic array)
+            string[] memory tail;
+            uint256 chatCount = _chatCount(cell);
+            if (maxChatTail != 0 && chatCount != 0) {
+                uint256 k = chatCount > maxChatTail ? uint256(maxChatTail) : chatCount;
+                tail = new string[](k);
+                uint256 startIdx = chatCount - k;
+                for (uint256 t; t != k;) {
+                    tail[t] = _messageAt(cell, startIdx + t);
+                    unchecked {
+                        ++t;
+                    }
+                }
+            }
+
+            // Assign
+            CellDeep memory row;
+            row.cell = cell;
+            row.owners = os;
+            row.ownerENS = ens;
+            row.userRole = role;
+            row.balances = bals;
+            row.allowanceToUser = toUser;
+            row.allowanceToOtherOwner = toOther;
+            row.chatCount = chatCount;
+            row.lastMessages = tail;
+
+            out[j] = row;
+            unchecked {
+                ++j;
+            }
+        }
+    }
+
+    /// @notice Deep, user-scoped snapshot over the most recent logical cells.
+    function getRecentUserCellsDeep(
+        address user,
+        uint256 maxCount,
+        uint8 maxChatTail,
+        bool includeENS
+    ) external view returns (CellDeep[] memory out) {
+        uint256 total = _getCellCount();
+        if (maxCount == 0) return out;
+        uint256 n = total > maxCount ? maxCount : total;
+        uint256 start = total - n;
+        return getUserCellsDeepRange(user, start, n, maxChatTail, includeENS);
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Small helpers for delta-refreshes & batched lookups
+    /// -----------------------------------------------------------------------
+
+    /// @notice Batched approved[] lookups so UI avoids N separate RPCs.
+    function getApprovedBatch(address cell, bytes32[] calldata hashes)
+        external
+        view
+        returns (address[] memory out)
+    {
+        out = new address[](hashes.length);
+        for (uint256 i; i != hashes.length;) {
+            (bool ok, bytes memory data) =
+                cell.staticcall(abi.encodeWithSignature("approved(bytes32)", hashes[i]));
+            if (ok && data.length >= 32) {
+                out[i] = abi.decode(data, (address));
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Get last N messages without re-pulling the world.
+    function getRecentMessages(address cell, uint256 maxCount)
+        external
+        view
+        returns (string[] memory out)
+    {
+        uint256 count = _chatCount(cell);
+        if (count == 0 || maxCount == 0) return out;
+        uint256 n = count > maxCount ? maxCount : count;
+        uint256 start = count - n;
+        out = _messagesRange(cell, start, n);
+    }
+
+    /// @notice Fetch a messages slice (for delta appends).
+    function getMessagesRange(address cell, uint256 start, uint256 count)
+        external
+        view
+        returns (string[] memory out)
+    {
+        uint256 len = _chatCount(cell);
+        if (start >= len || count == 0) return out;
+        uint256 end = start + count;
+        if (end > len) end = len;
+        uint256 n = end - start;
+        out = _messagesRange(cell, start, n);
+    }
+
+    /// Optional passthrough (handy in UIs)
+    function getCellsCount() external view returns (uint256) {
+        return _getCellCount();
+    }
+
+    /// -----------------------------------------------------------------------
+    /// Internals: bounds, owners, balances, allowances, chat, ENS
     /// -----------------------------------------------------------------------
 
     function _boundedRange(uint256 start, uint256 count)
@@ -218,14 +420,36 @@ contract CellsViewHelper {
         n = end - start;
     }
 
+    /// @dev Total logical count across CELLS and CELLS_LITE.
     function _getCellCount() internal view returns (uint256 count) {
-        (bool ok, bytes memory data) = CELLS.staticcall(abi.encodeWithSelector(CELLS_COUNT));
-        if (ok && data.length >= 32) count = abi.decode(data, (uint256));
+        uint256 c0 = _getCellsCountFrom(CELLS);
+        uint256 c1 = _getCellsCountFrom(CELLS_LITE);
+        count = c0 + c1;
     }
 
+    function _getCellsCountFrom(address factory) internal view returns (uint256 count) {
+        (bool ok, bytes memory data) = factory.staticcall(abi.encodeWithSelector(CELLS_COUNT));
+        if (ok && data.length >= 32) {
+            count = abi.decode(data, (uint256));
+        }
+    }
+
+    /// @dev Maps a logical index into [CELLS cells..., CELLS_LITE cells...].
     function _getCellAt(uint256 idx) internal view returns (address cell) {
-        (bool ok, bytes memory data) = CELLS.staticcall(abi.encodeWithSelector(CELLS_AT, idx));
-        if (ok && data.length >= 32) cell = abi.decode(data, (address));
+        uint256 mainCount = _getCellsCountFrom(CELLS);
+        if (idx < mainCount) {
+            cell = _getCellAtFrom(CELLS, idx);
+        } else {
+            uint256 liteIdx = idx - mainCount;
+            cell = _getCellAtFrom(CELLS_LITE, liteIdx);
+        }
+    }
+
+    function _getCellAtFrom(address factory, uint256 idx) internal view returns (address cell) {
+        (bool ok, bytes memory data) = factory.staticcall(abi.encodeWithSelector(CELLS_AT, idx));
+        if (ok && data.length >= 32) {
+            cell = abi.decode(data, (address));
+        }
     }
 
     function _ownerAt(address cell, uint256 slot) internal view returns (address o) {
@@ -293,5 +517,52 @@ contract CellsViewHelper {
         (bool ok, bytes memory data) =
             cell.staticcall(abi.encodeWithSelector(CELL_ALLOWANCE, token, spender));
         if (ok && data.length >= 32) amt = abi.decode(data, (uint256));
+    }
+
+    function _chatCount(address cell) internal view returns (uint256 cnt) {
+        (bool ok, bytes memory data) = cell.staticcall(abi.encodeWithSelector(CELL_CHAT_COUNT));
+        if (ok && data.length >= 32) cnt = abi.decode(data, (uint256));
+    }
+
+    function _messagesRange(address cell, uint256 start, uint256 n)
+        internal
+        view
+        returns (string[] memory out)
+    {
+        out = new string[](n);
+        for (uint256 i; i != n;) {
+            out[i] = _messageAt(cell, start + i);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _messageAt(address cell, uint256 idx) internal view returns (string memory s) {
+        (bool ok, bytes memory data) = cell.staticcall(abi.encodeWithSelector(CELL_MESSAGES, idx));
+        if (!ok || data.length < 64) return "";
+        try this._decodeString(data) returns (string memory t) {
+            return t;
+        } catch {
+            return "";
+        }
+    }
+
+    /// @dev Calls CheckTheChain.whatIsTheNameOf(user); returns "" on any failure.
+    function _ensName(address user) internal view returns (string memory name) {
+        if (user == address(0)) return "";
+        (bool ok, bytes memory data) =
+            CHECK_THE_CHAIN.staticcall(abi.encodeWithSelector(WHAT_IS_THE_NAME_OF, user));
+        if (!ok || data.length < 64) return "";
+        try this._decodeString(data) returns (string memory s) {
+            return s;
+        } catch {
+            return "";
+        }
+    }
+
+    /// @dev helper to permit try/catch on abi.decode (must be external)
+    function _decodeString(bytes memory data) external pure returns (string memory s) {
+        s = abi.decode(data, (string));
     }
 }

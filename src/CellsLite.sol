@@ -4,6 +4,7 @@ pragma solidity ^0.8.30;
 /// @title Cell Wallet (Cell/CellWall.eth)
 /// @notice 2-of-2 smart contract wallet,
 /// with a soft guardian 2-of-3 role too.
+/// This Cell uses a minimal proxy clone.
 contract Cell {
     error Signed();
     error Expired();
@@ -22,9 +23,7 @@ contract Cell {
     mapping(address token => mapping(address spender => uint256)) public allowance;
     mapping(bytes32 hash => mapping(address spender => uint256 count)) public permits;
 
-    address immutable CELLS;
-    uint256 immutable INITIAL_CHAIN_ID;
-    bytes32 immutable INITIAL_DOMAIN_SEPARATOR;
+    address immutable CELLS = msg.sender;
 
     bytes32 constant SIGN_BATCH_ARRAYS_TYPEHASH = keccak256(
         "SignBatch(address[] tos,uint256[] values,bytes32[] dataHashes,bytes32 nonce,uint256 deadline)"
@@ -32,15 +31,15 @@ contract Cell {
 
     event OwnershipTransferred(address indexed from, address indexed to);
 
-    /// @dev Construct 2/2 Cell with sorted owners and optional guardian.
-    constructor(address owner0, address owner1, address guardian) payable {
+    /// @dev Construct 2/2 Cells lite template.
+    constructor() payable {}
+
+    /// @dev Init 2/2 Cell with sorted owners and optional guardian. Cells lite.
+    function init(address owner0, address owner1, address guardian) public payable {
+        require(msg.sender == CELLS, NotOwner());
         require(owner0 != address(0) && owner1 != address(0) && owner0 != owner1, BadOwner());
         (owner0, owner1) = owner1 < owner0 ? (owner1, owner0) : (owner0, owner1);
         emit OwnershipTransferred(owners[0] = owner0, owners[1] = owner1);
-
-        CELLS = msg.sender;
-        INITIAL_CHAIN_ID = block.chainid;
-        INITIAL_DOMAIN_SEPARATOR = _computeDomainSeparator();
 
         if (guardian != address(0)) {
             require(guardian != owner0 && guardian != owner1, BadOwner());
@@ -372,12 +371,6 @@ contract Cell {
 
     /// @dev EIP-712 domain separator.
     function DOMAIN_SEPARATOR() public view returns (bytes32) {
-        return
-            block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : _computeDomainSeparator();
-    }
-
-    /// @dev EIP-712 domain computation.
-    function _computeDomainSeparator() internal view returns (bytes32) {
         return keccak256(
             abi.encode(
                 keccak256(
@@ -477,14 +470,18 @@ function safeTransfer(address token, address to, uint256 amount) {
 }
 
 /// @title Cell Wallet: Cells (Cell/CellWall.eth)
-contract Cells {
+contract CellsLite {
     event NewCell(address indexed creator, Cell indexed cell);
-    mapping(address owner => Cell[]) public ownerCells;
+    Cell immutable implementation;
     Cell[] public cells;
 
-    constructor() payable {}
+    error DeploymentFailed();
 
-    /// @dev Construct new Cell with initialization calls.
+    constructor() payable {
+        emit NewCell(address(this), implementation = new Cell{salt: bytes32(0)}());
+    }
+
+    /// @dev Construct new lite Cell clone with initialization calls.
     function createCell(
         address owner0,
         address owner1,
@@ -492,13 +489,22 @@ contract Cells {
         bytes32 salt,
         bytes[] calldata initCalls
     ) public payable returns (Cell cell, bool[] memory oks, bytes[] memory retDatas) {
-        emit NewCell(
-            msg.sender, cell = new Cell{value: msg.value, salt: salt}(owner0, owner1, guardian)
-        );
+        bytes32 _salt = keccak256(abi.encodePacked(owner0, owner1, guardian, salt));
+        Cell _implementation = implementation;
+        assembly ("memory-safe") {
+            mstore(0x24, 0x5af43d5f5f3e6029573d5ffd5b3d5ff3)
+            mstore(0x14, _implementation)
+            mstore(0x00, 0x602d5f8160095f39f35f5f365f5f37365f73)
+            cell := create2(callvalue(), 0x0e, 0x36, _salt)
+            if iszero(cell) {
+                mstore(0x00, 0x30116425)
+                revert(0x1c, 0x04)
+            }
+            mstore(0x24, 0)
+        }
+        emit NewCell(msg.sender, cell);
+        cell.init(owner0, owner1, guardian);
         cells.push(cell);
-        ownerCells[owner0].push(cell);
-        ownerCells[owner1].push(cell);
-        if (guardian != address(0)) ownerCells[guardian].push(cell);
         uint256 len = initCalls.length;
         if (len != 0) {
             oks = new bool[](len);
